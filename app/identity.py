@@ -31,6 +31,8 @@ def e164(number: str, default_cc: str = "49") -> str:
         return "+" + n[2:]
     if n.startswith("0"):
         return f"+{default_cc}{n[1:]}"
+    if n.startswith(default_cc) and len(n) > len(default_cc) + 5:
+        return f"+{n}"
     return f"+{default_cc}{n}"
 
 

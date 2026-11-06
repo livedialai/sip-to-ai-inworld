@@ -146,6 +146,10 @@ class AIConfig:
     inworld_vad_threshold: float = 0.62
     inworld_min_end_of_turn_silence: int = 500
     inworld_end_of_turn_confidence: float = 0.75
+    # PHP-Worker (Lima): Tenant-Aufloesung, Produktsuche, Bestellung
+    worker_base_url: str = "https://jambonz.gofonia.de"
+    search_url: str = ""
+    order_url: str = ""
 
     # Deepgram Configuration
     deepgram_api_key: str = ""
@@ -262,6 +266,9 @@ class Config:
             inworld_vad_threshold=float(os.getenv("INWORLD_VAD_THRESHOLD", "0.62")),
             inworld_min_end_of_turn_silence=int(os.getenv("INWORLD_MIN_END_OF_TURN_SILENCE", "500")),
             inworld_end_of_turn_confidence=float(os.getenv("INWORLD_END_OF_TURN_CONFIDENCE", "0.75")),
+            worker_base_url=os.getenv("WORKER_BASE_URL", "https://jambonz.gofonia.de"),
+            search_url=os.getenv("SEARCH_URL", ""),
+            order_url=os.getenv("ORDER_URL", ""),
             deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
             deepgram_listen_model=os.getenv("DEEPGRAM_LISTEN_MODEL", "flux-general-en"),
             deepgram_speak_model=os.getenv("DEEPGRAM_SPEAK_MODEL", "flux-kit-en"),

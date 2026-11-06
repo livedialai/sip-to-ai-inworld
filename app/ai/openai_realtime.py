@@ -479,6 +479,9 @@ class OpenAIRealtimeClient(AiDuplexBase):
         response: Dict[str, Any] = {
             "instructions": self._greeting,
             "output_modalities": ["audio"],
+            # Beim Gruss keine Tool-Calls: der erste Turn hat keine
+            # Kundenaeusserung, ein function_call waere ungueltig (Gemini 400).
+            "tool_choice": "none",
             "metadata": {
                 "response_purpose": "greeting"
             }
@@ -712,6 +715,14 @@ class OpenAIRealtimeClient(AiDuplexBase):
         else:
             # Log unhandled events for debugging
             self._logger.debug(f"Unhandled event: {msg_type}", data=data)
+
+        # Provider-Hook: Unterklassen (z.B. Inworld) haengen sich hier ein
+        hook = getattr(self, "_on_provider_event", None)
+        if hook is not None:
+            try:
+                await hook(msg_type, data)
+            except Exception as exc:  # noqa: BLE001 - darf den Audiofluss nicht stoppen
+                self._logger.warning("provider hook failed", error=str(exc), msg_type=msg_type)
 
     def _format_error_message(self, err: Dict[str, Any]) -> str:
         """Return a useful error string without logging credentials."""

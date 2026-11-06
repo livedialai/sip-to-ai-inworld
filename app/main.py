@@ -4,7 +4,7 @@ import asyncio
 import logging
 import signal
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 import structlog
 
@@ -15,6 +15,8 @@ from app.ai.duplex_base import AiDuplexClient
 from app.ai.gemini_live import GeminiLiveClient
 from app.ai.grok_voice import GrokVoiceClient
 from app.ai.inworld_realtime import InworldRealtimeClient
+from app.tenant import fetch_prompt, fetch_tenant
+from app.tools import CallState, ToolRunner
 from app.ai.openai_realtime import OpenAIRealtimeClient
 from app.bridge import AudioAdapter, CallSession
 from app.config import config
@@ -107,7 +109,7 @@ def _load_agent_config(logger: structlog.BoundLogger) -> tuple[str, Optional[str
     return agent_config.instructions, agent_config.greeting
 
 
-def create_ai_client() -> AiDuplexClient:
+async def create_ai_client(call: Any = None) -> AiDuplexClient:
     """Create AI client based on configuration.
 
     Returns:
@@ -170,16 +172,60 @@ def create_ai_client() -> AiDuplexClient:
             instructions_length=len(instructions),
         )
 
+        # --- Tenant per DID, Tools und Zustand pro Anruf -------------------
+        identity = getattr(call, "identity", {}) or {}
+        did = identity.get("did", "")
+        ani = identity.get("ani", "")
+        tenant = await fetch_tenant(did, config.ai.worker_base_url, ani) if did else None
+        voice = config.ai.inworld_voice
+        if tenant:
+            prompt_text = await fetch_prompt(str(tenant.get("prompt_url") or ""))
+            if prompt_text:
+                instructions = prompt_text
+            voice = tenant.get("voice_id") or voice
+            greeting = tenant.get("begruessung") or greeting
+            if greeting:
+                # Ohne Rollenangabe liest Inworld den Gruss als Kundenaeusserung
+                # und antwortet dann selbst als Anrufer.
+                greeting = (
+                    "Du bist Nadine, die Mitarbeiterin vom Markt. Begruesse den Anrufer "
+                    f'jetzt mit genau diesen Worten, ohne Zusatz: "{greeting}"'
+                )
+            logger.info(
+                "tenant applied",
+                tenant_id=tenant.get("id"),
+                did=did,
+                voice=voice,
+                prompt_len=len(instructions or ""),
+            )
+        state = CallState(
+            call_id=str(getattr(call, "call_id", "") or ""),
+            did=did,
+            ani=ani,
+            tenant_id=int(tenant.get("id") or 0) if tenant else 0,
+        )
+        base = config.ai.worker_base_url.rstrip("/")
+        runner = ToolRunner(
+            state,
+            search_url=config.ai.search_url or f"{base}/tool/search",
+            order_url=config.ai.order_url or f"{base}/s2s/order",
+            phrases=(tenant or {}).get("phrases") or {},
+            max_steps=int((tenant or {}).get("max_tool_steps") or 6),
+        )
+        logger.info("tools enabled", count=len(runner.tools), call_id=state.call_id)
+
         client = InworldRealtimeClient(
             api_key=config.ai.inworld_api_key,
             model=config.ai.inworld_model,
-            voice=config.ai.inworld_voice,
+            voice=voice,
             ws_endpoint=config.ai.inworld_ws_endpoint,
             instructions=instructions,
             greeting=greeting,
             audio_format=config.ai.openai_audio_format,
             tts_model=config.ai.inworld_tts_model,
             stt_model=config.ai.inworld_stt_model,
+            tools=runner.tools,
+            tool_runner=runner.run,
             provider_data={
                 "stt": {
                     "voice_profile": True,
@@ -326,7 +372,7 @@ async def run_real_mode(stop_event: Optional[asyncio.Event] = None) -> None:
             )
 
             # Create AI client for this call
-            ai_client = create_ai_client()
+            ai_client = await create_ai_client(call)
 
             # Create CallSession
             call_session = CallSession(
