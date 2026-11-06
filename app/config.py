@@ -1,0 +1,309 @@
+"""Configuration module for SIP-to-AI bridge."""
+
+import os
+from dataclasses import dataclass
+from typing import Callable, Literal, Optional, TypeVar
+
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+
+_N = TypeVar("_N", int, float)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean env var (true/false/1/0/yes/no, case-insensitive)."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw in ("false", "0", "no"):
+        return False
+    raise ValueError(f"{name} must be true/false/1/0/yes/no, got: {raw!r}")
+
+
+def _optional_number(name: str, cast: Callable[[str], _N]) -> Optional[_N]:
+    """Read an optional numeric env var; unset/blank -> None (setting not sent)."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return cast(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got: {raw!r}") from None
+
+
+@dataclass(frozen=True)
+class AudioConfig:
+    """Audio processing configuration.
+
+    Note: Fixed audio parameters for telephony compatibility:
+    - Frame duration: 20ms (telephony standard)
+    - Sample rate: 8kHz (PJSUA2 and telephony standard)
+    - PJSUA2: PCM16 @ 8kHz (320 bytes/frame)
+    - AI clients: Handle conversion internally (PCM16 → their format)
+    """
+
+    # Fixed audio parameters (not configurable)
+    FRAME_MS: int = 20      # Fixed: 20ms telephony standard
+    SAMPLE_RATE: int = 8000 # Fixed: 8kHz telephony standard
+
+    # Buffer configuration (configurable)
+    uplink_buf_frames: int = 100
+    downlink_buf_frames: int = 200
+
+    @property
+    def frame_ms(self) -> int:
+        """Frame duration in milliseconds."""
+        return self.FRAME_MS
+
+    @property
+    def sip_sr(self) -> int:
+        """SIP sample rate (compatibility alias)."""
+        return self.SAMPLE_RATE
+
+    @property
+    def ai_sr(self) -> int:
+        """AI sample rate (compatibility alias)."""
+        return self.SAMPLE_RATE
+
+    @property
+    def frame_size_sip(self) -> int:
+        """Samples per frame at SIP sample rate."""
+        return (self.sip_sr * self.frame_ms) // 1000
+
+    @property
+    def frame_size_ai(self) -> int:
+        """Samples per frame at AI sample rate."""
+        return (self.ai_sr * self.frame_ms) // 1000
+
+    @property
+    def bytes_per_frame_sip_pcm16(self) -> int:
+        """Bytes per frame for SIP in PCM16 format (PJSUA2 interface).
+        
+        Returns:
+            320 bytes for 20ms @ 8kHz PCM16
+        """
+        return self.frame_size_sip * 2
+    
+    @property
+    def bytes_per_frame_sip(self) -> int:
+        """Bytes per frame for SIP (PCM16). Alias for bytes_per_frame_sip_pcm16."""
+        return self.bytes_per_frame_sip_pcm16
+
+    @property
+    def bytes_per_frame_ai_g711(self) -> int:
+        """Bytes per frame for AI in G.711 format (OpenAI Realtime).
+        
+        Returns:
+            160 bytes for 20ms @ 8kHz G.711
+        """
+        return self.frame_size_ai
+    
+    @property
+    def bytes_per_frame_ai(self) -> int:
+        """Bytes per frame for AI (G.711). Alias for bytes_per_frame_ai_g711."""
+        return self.bytes_per_frame_ai_g711
+
+
+@dataclass(frozen=True)
+class AIConfig:
+    """AI service configuration.
+
+    Note: VAD, barge-in, and turn-taking are handled by AI services (OpenAI/Deepgram/Gemini).
+    No client-side configuration needed.
+    """
+
+    vendor: Literal["openai", "deepgram", "gemini", "grok", "inworld"] = "openai"
+
+    # Agent Prompt Configuration (shared across vendors)
+    # NOTE: Path can be relative (resolved from project root) or absolute
+    agent_prompt_file: str = ""  # REQUIRED: Path to YAML file with agent prompts (greeting + instructions)
+
+    # OpenAI Configuration
+    openai_api_key: str = ""
+    openai_project: str = ""
+    openai_organization: str = ""
+    openai_ws_endpoint: str = "wss://api.openai.com/v1/realtime"
+    openai_model: str = "gpt-realtime-2.1"
+    openai_voice: str = "marin"  # Empty: omit voice and use the server default
+    # "pcmu": G.711 μ-law @ 8kHz passthrough (OpenAI default)
+    # "pcm16": PCM16 @ 24kHz with resampling (Realtime-compatible gateways such as cascade)
+    openai_audio_format: Literal["pcmu", "pcm16"] = "pcmu"
+    # "near_field" | "far_field" | "none" (sends null; required by gateways that reject noise reduction)
+    openai_noise_reduction: Literal["near_field", "far_field", "none"] = "near_field"
+
+    # Inworld Configuration (OpenAI-kompatibles Realtime-Protokoll)
+    inworld_api_key: str = ""          # Basic (Base64) Key aus dem Inworld-Portal
+    inworld_ws_endpoint: str = "wss://api.inworld.ai/api/v1/realtime/session"
+    inworld_model: str = "google/gemini-3.1-flash-lite"
+    inworld_voice: str = ""            # z. B. default-gir-...__nadine-neu
+    inworld_tts_model: str = "inworld-tts-2"
+    inworld_stt_model: str = "inworld-stt-1"
+    inworld_vad_threshold: float = 0.62
+    inworld_min_end_of_turn_silence: int = 500
+    inworld_end_of_turn_confidence: float = 0.75
+
+    # Deepgram Configuration
+    deepgram_api_key: str = ""
+    deepgram_listen_model: str = "flux-general-en"  # STT model (flux-general-en, or legacy nova-2/nova-3)
+    deepgram_speak_model: str = "flux-kit-en"  # TTS voice (when speak_provider=deepgram)
+    deepgram_llm_model: str = "gpt-4o-mini"  # LLM model for agent
+    # Optional Flux turn-detection / TTS tuning; None = not sent (Deepgram defaults)
+    deepgram_eot_threshold: Optional[float] = None
+    deepgram_eager_eot_threshold: Optional[float] = None
+    deepgram_eot_timeout_ms: Optional[int] = None
+    deepgram_speak_speed: Optional[float] = None
+    # Let the caller interrupt the agent (Flux only). Disable on speakerphone/no-AEC lines.
+    deepgram_barge_in: bool = True
+
+    # Speak provider: who renders the Deepgram agent's voice.
+    #   "deepgram" -> built-in Deepgram TTS (default: Flux flux-kit-en)
+    #   "60db"     -> Deepgram stays the brain (STT+LLM+turn-taking), 60db is the voice
+    speak_provider: Literal["deepgram", "60db"] = "deepgram"
+
+    # 60db Voice (used when speak_provider=60db)
+    sixtydb_api_key: str = ""
+    sixtydb_voice_id: str = "fbb75ed2-975a-40c7-9e06-38e30524a9a1"  # 60db default voice
+
+    # Gemini Live Configuration
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.8-live"  # Model with Live API support
+    gemini_voice: str = "Puck"  # Voice: Puck, Charon, Kore, Fenrir, Aoede
+
+    # xAI Grok Voice Configuration
+    grok_api_key: str = ""
+    grok_ws_endpoint: str = "wss://api.x.ai/v1/realtime"
+    grok_model: str = "grok-voice-3.0"
+    grok_voice: str = "eve"  # Built-in voices: eve (default), ara, leo, rex, sal
+
+
+@dataclass(frozen=True)
+class SIPConfig:
+    """SIP/PJSUA2 configuration for userless account (receive-only mode).
+
+    Note: This configuration is for receiving incoming SIP INVITE requests only.
+    No registration to SIP server required.
+    Typically used in internal network, TLS not required.
+    """
+
+    domain: str = "localhost"  # SIP domain/IP for URI (useful for multi-IP servers)
+    transport_type: Literal["udp", "tcp"] = "udp"
+    port: int = 5060
+
+
+@dataclass(frozen=True)
+class SystemConfig:
+    """System-wide configuration."""
+
+    log_level: str = "INFO"
+    log_format: Literal["json", "text"] = "json"
+    health_check_interval_sec: int = 30
+    reconnect_delay_sec: int = 5
+    max_reconnect_attempts: int = 3
+    ai_connection_timeout_sec: int = 10  # Timeout for AI WebSocket connection
+
+
+class Config:
+    """Main configuration class."""
+
+    def __init__(self) -> None:
+        """Initialize configuration from environment variables."""
+        self.audio = AudioConfig(
+            uplink_buf_frames=int(os.getenv("UPLINK_BUF_FRAMES", "100")),
+            downlink_buf_frames=int(os.getenv("DOWNLINK_BUF_FRAMES", "200")),
+        )
+
+        ai_vendor = os.getenv("AI_VENDOR", "mock").lower()
+        if ai_vendor not in ["mock", "openai", "deepgram", "gemini", "grok", "inworld"]:
+            ai_vendor = "mock"
+
+        # Fail fast on an unknown SPEAK_PROVIDER rather than silently using the
+        # Deepgram voice (which would mask a 60db misconfiguration).
+        speak_provider = os.getenv("SPEAK_PROVIDER", "deepgram").lower()
+        if speak_provider not in ("deepgram", "60db"):
+            raise ValueError(
+                f"SPEAK_PROVIDER must be 'deepgram' or '60db', got: {speak_provider!r}"
+            )
+
+        openai_audio_format = os.getenv("OPENAI_AUDIO_FORMAT", "pcmu").lower()
+        if openai_audio_format not in ("pcmu", "pcm16"):
+            raise ValueError(
+                f"OPENAI_AUDIO_FORMAT must be 'pcmu' or 'pcm16', got: {openai_audio_format!r}"
+            )
+
+        openai_noise_reduction = os.getenv("OPENAI_NOISE_REDUCTION", "near_field").lower()
+        if openai_noise_reduction not in ("near_field", "far_field", "none"):
+            raise ValueError(
+                "OPENAI_NOISE_REDUCTION must be 'near_field', 'far_field' or 'none', "
+                f"got: {openai_noise_reduction!r}"
+            )
+
+        self.ai = AIConfig(
+            vendor=ai_vendor,  # type: ignore
+            agent_prompt_file=os.getenv("AGENT_PROMPT_FILE", ""),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            openai_project=os.getenv("OPENAI_PROJECT", os.getenv("OPENAI_PROJECT_ID", "")),
+            openai_organization=os.getenv("OPENAI_ORGANIZATION", os.getenv("OPENAI_ORG_ID", "")),
+            openai_ws_endpoint=os.getenv("OPENAI_WS_ENDPOINT", "wss://api.openai.com/v1/realtime"),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-realtime-2.1"),
+            openai_voice=os.getenv("OPENAI_VOICE", "marin"),
+            openai_audio_format=openai_audio_format,  # type: ignore
+            openai_noise_reduction=openai_noise_reduction,  # type: ignore
+            inworld_api_key=os.getenv("INWORLD_API_KEY", os.getenv("INWORLD_KEY", "")),
+            inworld_ws_endpoint=os.getenv("INWORLD_WS_ENDPOINT", "wss://api.inworld.ai/api/v1/realtime/session"),
+            inworld_model=os.getenv("INWORLD_MODEL", "google/gemini-3.1-flash-lite"),
+            inworld_voice=os.getenv("INWORLD_VOICE", ""),
+            inworld_tts_model=os.getenv("INWORLD_TTS_MODEL", "inworld-tts-2"),
+            inworld_stt_model=os.getenv("INWORLD_STT_MODEL", "inworld-stt-1"),
+            inworld_vad_threshold=float(os.getenv("INWORLD_VAD_THRESHOLD", "0.62")),
+            inworld_min_end_of_turn_silence=int(os.getenv("INWORLD_MIN_END_OF_TURN_SILENCE", "500")),
+            inworld_end_of_turn_confidence=float(os.getenv("INWORLD_END_OF_TURN_CONFIDENCE", "0.75")),
+            deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
+            deepgram_listen_model=os.getenv("DEEPGRAM_LISTEN_MODEL", "flux-general-en"),
+            deepgram_speak_model=os.getenv("DEEPGRAM_SPEAK_MODEL", "flux-kit-en"),
+            deepgram_llm_model=os.getenv("DEEPGRAM_LLM_MODEL", "gpt-4o-mini"),
+            deepgram_eot_threshold=_optional_number("DEEPGRAM_EOT_THRESHOLD", float),
+            deepgram_eager_eot_threshold=_optional_number("DEEPGRAM_EAGER_EOT_THRESHOLD", float),
+            deepgram_eot_timeout_ms=_optional_number("DEEPGRAM_EOT_TIMEOUT_MS", int),
+            deepgram_speak_speed=_optional_number("DEEPGRAM_SPEAK_SPEED", float),
+            deepgram_barge_in=_env_bool("DEEPGRAM_BARGE_IN", True),
+            speak_provider=speak_provider,  # type: ignore
+            sixtydb_api_key=os.getenv("SIXTYDB_API_KEY", ""),
+            sixtydb_voice_id=os.getenv(
+                "SIXTYDB_VOICE_ID", "fbb75ed2-975a-40c7-9e06-38e30524a9a1"
+            ),
+            gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-live"),
+            gemini_voice=os.getenv("GEMINI_VOICE", "Puck"),
+            grok_api_key=os.getenv("XAI_API_KEY", ""),
+            grok_ws_endpoint=os.getenv("GROK_WS_ENDPOINT", "wss://api.x.ai/v1/realtime"),
+            grok_model=os.getenv("GROK_MODEL", "grok-voice-3.0"),
+            grok_voice=os.getenv("GROK_VOICE", "eve"),
+        )
+
+        self.sip = SIPConfig(
+            domain=os.getenv("SIP_DOMAIN", "localhost"),
+            transport_type=os.getenv("SIP_TRANSPORT_TYPE", "udp"),  # type: ignore
+            port=int(os.getenv("SIP_PORT", "5060")),
+        )
+
+        self.system = SystemConfig(
+            log_level=os.getenv("LOG_LEVEL", "INFO"),
+            log_format=os.getenv("LOG_FORMAT", "json"),  # type: ignore
+            health_check_interval_sec=int(os.getenv("HEALTH_CHECK_INTERVAL_SEC", "30")),
+            reconnect_delay_sec=int(os.getenv("RECONNECT_DELAY_SEC", "5")),
+            max_reconnect_attempts=int(os.getenv("MAX_RECONNECT_ATTEMPTS", "3")),
+            ai_connection_timeout_sec=int(os.getenv("AI_CONNECTION_TIMEOUT_SEC", "10")),
+        )
+
+    @classmethod
+    def load(cls) -> "Config":
+        """Load configuration from environment."""
+        return cls()
+
+
+config = Config.load()

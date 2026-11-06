@@ -1,0 +1,11 @@
+sip-to-ai-inworld
+Copyright 2026 Weser-AI (Thomas Barthel)
+
+This product includes software developed as part of
+sip-to-ai (https://github.com/aicc2025/sip-to-ai),
+licensed under the Apache License, Version 2.0.
+
+Changes by Weser-AI:
+  - app/ai/inworld_realtime.py (new): Inworld Realtime provider
+  - app/ai/openai_realtime.py: _build_ws_url() hook for vendor-specific URLs
+  - app/config.py, app/main.py: INWORLD_* configuration and vendor wiring

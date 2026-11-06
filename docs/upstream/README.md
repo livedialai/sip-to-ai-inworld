@@ -1,0 +1,378 @@
+# SIP-to-AI
+
+Why this project exists
+
+Most voice agent frameworks:
+- require WebRTC
+- rely on heavy dependencies (C / ffmpeg)
+- are not telephony-native
+
+This project:
+- pure Python SIP + RTP (no C deps)
+- direct bridge to realtime AI
+- built for call center / telephony scenarios
+
+**SIP-to-AI** — stream RTP audio from **FreeSWITCH / OpenSIPS / Asterisk** directly to **end-to-end realtime voice models**:
+- ✅ **OpenAI Realtime API** (`gpt-realtime-2.1`)
+- ✅ **Deepgram Voice Agent**
+- ✅ **Gemini Live** (`gemini-3.8-live`)
+- ✅ **xAI Grok Voice** (grok-voice-3.0)
+
+Simple passthrough bridge: **SIP (G.711 μ-law @ 8kHz)** ↔ **AI voice models**. OpenAI, Deepgram, and Grok support native G.711, Gemini requires PCM16 resampling (8kHz ↔ 16kHz/24kHz).
+
+**Prefer a cascaded ASR → LLM → TTS pipeline?** sip-to-ai can drive one through [cascade-realtime-gateway](https://github.com/rasonyang/cascade-realtime-gateway), which exposes it as an OpenAI Realtime-compatible endpoint. [Details below](#not-using-an-end-to-end-voice-model).
+
+## Quick Start (OpenAI Realtime)
+
+**Prerequisites:** Python 3.12+, UV package manager
+
+**Pure Python, No External Dependencies:** This project uses a pure Python asyncio implementation of SIP+RTP. No C libraries or compilation required!
+
+1. **Install dependencies:**
+   ```bash
+   git clone <repository-url>
+   cd sip-to-ai
+   uv venv && source .venv/bin/activate
+   uv sync
+   ```
+
+2. **Configure environment:**
+   ```bash
+   cp .env.example .env
+   ```
+
+   Edit `.env` with your OpenAI API key:
+   ```bash
+   # AI Service
+   AI_VENDOR=openai
+   OPENAI_API_KEY=sk-proj-your-key-here
+   OPENAI_PROJECT=proj-your-project-id-here
+   OPENAI_MODEL=gpt-realtime-2.1
+
+   # Agent prompt
+   AGENT_PROMPT_FILE=agent_prompt.yaml
+
+   # SIP Settings (userless account - receive only)
+   SIP_DOMAIN=192.168.1.100
+   SIP_TRANSPORT_TYPE=udp
+   SIP_PORT=6060
+   ```
+
+   **Optional:** Create `agent_prompt.yaml` for custom agent personality:
+   ```yaml
+   instructions: |
+     You are a helpful AI assistant. Be concise and friendly.
+
+   greeting: "Hello! How can I help you today?"
+   ```
+
+3. **Run the server:**
+   ```bash
+   uv run python -m app.main
+   ```
+
+   The server will listen on `SIP_DOMAIN:SIP_PORT` for incoming calls. Each call creates an independent OpenAI Realtime WebSocket connection.
+
+4. **Make a test call:**
+   ```bash
+   # From FreeSWITCH/Asterisk, dial to bridge IP:port
+   # Or use a SIP softphone to call sip:192.168.1.100:6060
+   ```
+
+## Project Overview
+
+### Core Architecture
+
+```mermaid
+graph LR
+    SIP[Pure Asyncio SIP+RTP<br/>G.711 @ 8kHz] <--> AA[AudioAdapter<br/>Codec/Resample]
+    AA <--> AI[AI WebSocket<br/>OpenAI/Deepgram/Gemini]
+
+```
+
+**Design Philosophy**: Minimal client logic. The bridge is a transparent audio pipe:
+- **Pure Python asyncio**: No GIL issues, no C dependencies
+- **Codec conversion only**: PCM16 ↔ G.711 μ-law (OpenAI/Deepgram: same 8kHz, no resampling; Gemini: 8kHz ↔ 16kHz/24kHz resampling)
+- **Precise 20ms timing**: Using `asyncio.sleep()` with drift correction
+- **Structured concurrency**: All tasks managed with `asyncio.TaskGroup`
+- **No client-side VAD/barge-in**: AI models handle all voice activity detection
+- **No jitter buffer**: AI services provide pre-buffered audio
+- **Connection management**: WebSocket lifecycle and reconnection
+
+### Audio Flow
+
+```mermaid
+sequenceDiagram
+    participant RTP as RTP Session
+    participant Bridge as Audio Bridge
+    participant AI as AI Service
+
+    Note over RTP,AI: Uplink (SIP → AI)
+    RTP->>Bridge: Receive G.711 packet (160 bytes)
+    Bridge->>Bridge: G.711 → PCM16 (320 bytes)
+    Bridge->>AI: WebSocket send(PCM16)
+
+    Note over RTP,AI: Downlink (AI → SIP)
+    AI->>Bridge: WebSocket receive(PCM16 chunks)
+    Bridge->>Bridge: Accumulate & split to 320-byte frames
+    Bridge->>Bridge: PCM16 → G.711 (160 bytes)
+    RTP->>Bridge: Request audio frame
+    Bridge->>RTP: Send G.711 packet (160 bytes)
+```
+
+**Key Points:**
+- **20ms frames**: 320 bytes PCM16 (8kHz) or 160 bytes G.711 μ-law
+- **Asyncio-based**: RTP protocol → asyncio.Queue → async AI WebSocket
+- **Variable AI chunks**: Accumulated in buffer, split into fixed 320-byte frames
+- **No padding during streaming**: Incomplete frames kept until next chunk arrives
+
+### Components
+
+#### SIP+RTP Stack (`app/sip_async/`)
+
+**`AsyncSIPServer`** (`app/sip_async/async_sip_server.py`)
+- Pure asyncio SIP server listening for INVITE requests
+- UDP datagram protocol for SIP signaling
+- Creates AsyncCall instances for each incoming call
+- Handles SIP messages: INVITE, ACK, BYE with proper RFC 3261 responses
+
+**`RTPSession`** (`app/sip_async/rtp_session.py`)
+- Pure asyncio RTP protocol implementation
+- G.711 μ-law codec (PCMU) support
+- Precise 20ms frame timing with drift correction
+- Bidirectional audio streaming over UDP
+
+**`RTPAudioBridge`** (`app/sip_async/audio_bridge.py`)
+- Bridges RTP session with AudioAdapter
+- Handles G.711 ↔ PCM16 codec conversion
+- Uses asyncio.TaskGroup for structured concurrency
+
+#### Bridge Layer (`app/bridge/`)
+
+**`AudioAdapter`** (`app/bridge/audio_adapter.py`)
+- Audio format adapter for SIP ↔ AI streaming
+- PCM16 passthrough with optional codec conversion
+- Accumulation buffer for variable-size AI chunks → fixed 320-byte frames
+- Thread-safe buffers: `asyncio.Queue` for uplink and downlink
+
+**`CallSession`** (`app/bridge/call_session.py`)
+- Manages AI connection lifecycle for a single call
+- Three async tasks per call:
+  1. **Uplink**: Read from AudioAdapter → send to AI
+  2. **AI Receive**: Receive AI chunks → feed to AudioAdapter
+  3. **Health**: Ping AI connection, reconnect on failure
+- Uses `asyncio.TaskGroup` for structured concurrency
+
+#### AI Clients (`app/ai/`)
+
+**`OpenAIRealtimeClient`** (`app/ai/openai_realtime.py`)
+- WebSocket: `wss://api.openai.com/v1/realtime`
+- Audio format: `audio/pcmu` (G.711 μ-law @ 8kHz)
+- Supports session config: instructions, voice, temperature
+- Optional greeting message on connect
+
+**`DeepgramAgentClient`** (`app/ai/deepgram_agent.py`)
+- WebSocket: `wss://agent.deepgram.com/v1/agent/converse`
+- Audio format: mulaw (same as G.711 μ-law @ 8kHz)
+- Settings: listen model, speak model, LLM model, agent prompt
+
+**`GeminiLiveClient`** (`app/ai/gemini_live.py`)
+- WebSocket: `wss://generativelanguage.googleapis.com/ws/...BidiGenerateContent`
+- Audio format: PCM16 (input @ 16kHz, output @ 24kHz)
+- Resampling: 8kHz SIP ↔ 16kHz/24kHz Gemini (handled internally)
+- Uplink uses `realtimeInput.audio` Blob (the deprecated `mediaChunks` field is rejected by newer models such as `gemini-3.1-flash-live-preview` with WebSocket close 1007)
+- Settings: model, voice, system instructions
+
+**`GrokVoiceClient`** (`app/ai/grok_voice.py`)
+- WebSocket: `wss://api.x.ai/v1/realtime`
+- Audio format: `audio/pcmu` (G.711 μ-law @ 8kHz, no resampling)
+- Handshake: emits `conversation.created` as the connection-ready signal (not `session.created`)
+- Settings: model, voice, instructions; greeting via `response.create` with required `metadata.client_event_id`
+
+
+
+## Deepgram Voice Agent Setup
+
+Set `AI_VENDOR=deepgram` in `.env`:
+
+```bash
+AI_VENDOR=deepgram
+DEEPGRAM_API_KEY=your-key-here
+AGENT_PROMPT_FILE=agent_prompt.yaml  
+DEEPGRAM_LISTEN_MODEL=flux-general-en
+DEEPGRAM_SPEAK_MODEL=flux-kit-en
+DEEPGRAM_LLM_MODEL=gpt-4o-mini
+```
+
+Create `agent_prompt.yaml` (required):
+```yaml
+instructions: |
+  You are a helpful AI assistant. Be concise and friendly.
+
+greeting: "Hello! How can I help you today?"
+```
+
+Defaults are Deepgram's recommended models: **Flux STT** (`flux-general-en`), `gpt-4o-mini`, and **Flux TTS**
+(`flux-kit-en`). `gpt-5-mini` is also supported but measured noticeably slower per turn on real calls (1.5-6.6 s vs 0.1-0.4 s). The client sends `version: "v2"` for `flux-*` models and `"v1"` for everything else, so the
+legacy config keeps working:
+
+```bash
+DEEPGRAM_LISTEN_MODEL=nova-2
+DEEPGRAM_SPEAK_MODEL=aura-asteria-en
+DEEPGRAM_LLM_MODEL=gpt-4o-mini
+```
+
+- **Barge-in:** with a Flux listen model, caller audio is always forwarded and Deepgram's server-side turn
+  detection (`UserStartedSpeaking`) lets the caller interrupt the agent; queued agent audio is flushed. Legacy
+  `nova-*` models and `SPEAK_PROVIDER=60db` stay half-duplex (caller audio is dropped while the agent speaks
+  and for 2 s after). The greeting is always protected: caller audio is dropped until it finishes
+  (first `AgentAudioDone`, plus a 2 s tail). On speakerphone / lines without echo cancellation the agent hears
+  itself and interrupts itself; set `DEEPGRAM_BARGE_IN=false` (default `true`; accepts true/false/1/0/yes/no) to
+  stay half-duplex.
+- **Optional tuning** (only sent when set; Flux listen models only for the first three, valid range per Deepgram):
+  `DEEPGRAM_EOT_THRESHOLD` (0.5-1.0, default 0.7), `DEEPGRAM_EAGER_EOT_THRESHOLD` (0.3-0.9, must not exceed
+  the EOT threshold), `DEEPGRAM_EOT_TIMEOUT_MS` (default 5000), and `DEEPGRAM_SPEAK_SPEED` (TTS speed: Flux
+  0.5-1.5, Aura 0.7-1.5).
+- `language` is not sent for Flux (the language comes from the model name and the API rejects the field); it is
+  never sent on the speak provider.
+- Audio is sent as 20 ms μ-law frames (Deepgram recommends ~80 ms for Flux, but 20 ms frames were verified to
+  work with correct transcripts, and buffering would only add latency).
+
+Get your API key from [Deepgram Console](https://console.deepgram.com).
+
+### Use a 60db voice with the Deepgram brain (`SPEAK_PROVIDER=60db`)
+
+60db is **not** an end-to-end voice agent — it has no LLM, only speech I/O (STT, TTS, voices).
+So it cannot replace Deepgram. Instead it can be used as the **voice** of the Deepgram agent:
+Deepgram keeps doing STT + LLM (`gpt-4o-mini`) + VAD/turn-taking and emits the agent's reply
+as text (`ConversationText`); we synthesize that text with **60db TTS** (μ-law @ 8kHz) and feed
+it back to the caller. Deepgram is the brain, 60db is the mouth.
+
+```bash
+AI_VENDOR=deepgram
+DEEPGRAM_API_KEY=your-deepgram-key
+DEEPGRAM_LISTEN_MODEL=flux-general-en
+DEEPGRAM_LLM_MODEL=gpt-4o-mini
+AGENT_PROMPT_FILE=agent_prompt.yaml
+
+# Switch the voice to 60db
+SPEAK_PROVIDER=60db
+SIXTYDB_API_KEY=sk_live_your_60db_key
+SIXTYDB_VOICE_ID=fbb75ed2-975a-40c7-9e06-38e30524a9a1
+```
+
+List the voices on your 60db account to pick a `SIXTYDB_VOICE_ID`:
+
+```bash
+uv run python scripts/list_60db_voices.py
+```
+
+**How it works:** `60db TTS WebSocket` (`wss://api.60db.ai/ws/tts`) is configured for
+`MULAW` @ 8kHz, so its audio drops straight into the existing bridge with no resampling.
+`DEEPGRAM_SPEAK_MODEL` is ignored in this mode (Deepgram's own audio is discarded).
+
+**Trade-offs:** routing the reply text out to a second service adds some latency, and you lose
+Deepgram's native barge-in timing on the spoken audio (this mode is effectively half-duplex,
+matching the existing Deepgram barge-in suppression). Use it only when you specifically want a
+60db voice/clone. Get a 60db key from [60db](https://60db.ai).
+
+
+## Gemini Live Setup
+
+Set `AI_VENDOR=gemini` in `.env`:
+
+```bash
+AI_VENDOR=gemini
+GEMINI_API_KEY=your-key-here
+AGENT_PROMPT_FILE=agent_prompt.yaml
+GEMINI_MODEL=gemini-3.8-live
+GEMINI_VOICE=Puck
+```
+
+Supported models (any Live API model works): `gemini-3.8-live` (default); legacy previews `gemini-3.1-flash-live-preview`, `gemini-2.5-flash-native-audio-preview-12-2025`.
+
+Available voices: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`
+
+Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
+
+**Note:** Gemini Live uses PCM16 audio (16kHz input, 24kHz output), so the bridge performs resampling from/to 8kHz SIP audio. This adds minimal latency (<5ms).
+
+## Grok Voice Setup
+
+Set `AI_VENDOR=grok` in `.env`:
+
+```bash
+AI_VENDOR=grok
+XAI_API_KEY=your-key-here
+AGENT_PROMPT_FILE=agent_prompt.yaml
+GROK_MODEL=grok-voice-3.0
+GROK_VOICE=eve
+```
+
+Available built-in voices: `eve` (default), `ara`, `leo`, `rex`, `sal`.
+
+Available models:
+- `grok-voice-3.0` (recommended — latest generation, best UX with reasoning)
+- `grok-voice-latest` (alias that always tracks the newest release)
+
+Get your API key from [xAI Console](https://console.x.ai/).
+
+**Note:** Grok Voice supports native G.711 μ-law @ 8kHz — same as OpenAI and Deepgram, so no resampling overhead. The realtime protocol mirrors OpenAI's, including server-side VAD and barge-in.
+
+## Performance
+
+**Latency:**
+- SIP → AI: <10ms (codec only)
+- AI → SIP: <10ms (codec only)
+- Total: ~100-300ms (AI processing dominates)
+- 
+**Why Fast?**
+- OpenAI/Deepgram: No resampling (8kHz throughout)
+- Gemini: Minimal resampling overhead (<5ms)
+- No client-side VAD/barge-in
+- No jitter buffer
+- Just codec conversion
+
+## Not Using an End-to-End Voice Model?
+
+This project is built for speech-to-speech models. If you want separate **ASR → LLM → TTS** stages instead, use [**cascade-realtime-gateway**](https://github.com/rasonyang/cascade-realtime-gateway). It exposes the pipeline as an OpenAI Realtime-compatible WebSocket, so sip-to-ai connects to it with the OpenAI client.
+
+- **Pros:** pick or self-host each stage (Deepgram / Qwen ASR, OpenAI / Qwen LLM and TTS), function calling, barge-in
+- **Cons:** higher latency than an end-to-end model
+
+Configure `.env`:
+
+```bash
+AI_VENDOR=openai
+OPENAI_WS_ENDPOINT=ws://127.0.0.1:18080/v1/realtime
+OPENAI_API_KEY=sk-test          # the gateway's REALTIME_API_KEY
+OPENAI_MODEL=qwen               # any value; not used for routing
+OPENAI_AUDIO_FORMAT=pcm16       # required: cascade only accepts PCM16 @ 24kHz
+OPENAI_NOISE_REDUCTION=none     # required: cascade rejects noise reduction
+OPENAI_VOICE=                   # empty: use the voice configured in the gateway
+```
+
+## Troubleshooting
+
+**Choppy Audio:** Check network to AI service. AI handles jitter buffering.
+
+**High Latency:** Verify AI service response times. Client-side is <10ms.
+
+**SIP Connection Failed:**
+- Check firewall/NAT for incoming SIP INVITE on UDP port
+- Verify `SIP_DOMAIN` and `SIP_PORT` in `.env`
+- Check logs for SIP protocol errors
+
+**AI Disconnection:**
+- Validate API keys
+- Check service quotas and rate limits
+- Monitor logs for reconnection attempts
+
+
+## License
+
+Apache License 2.0
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+Pure Python implementation with no GPL dependencies.
