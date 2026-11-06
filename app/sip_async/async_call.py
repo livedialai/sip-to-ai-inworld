@@ -6,6 +6,7 @@ Manages a single SIP call with RTP session, audio bridge, and AI integration.
 import asyncio
 import contextlib
 import random
+import uuid
 from typing import TYPE_CHECKING, Optional, cast
 
 import structlog
@@ -758,6 +759,41 @@ class AsyncCall:
             await remove_call(self)
 
         logger.info("Call stopped", call_id=self.call_id)
+
+    async def refer(self, target: str) -> dict:
+        """Blind transfer: REFER an den Peer (PBX), Ziel ist eine Rufnummer.
+
+        Die PBX baut die neue Strecke auf und verbindet den Anrufer; unsere
+        Strecke wird danach per BYE abgebaut.
+        """
+        if self.state not in (STATE_ANSWERED, STATE_CONFIRMED):
+            return {"ok": False, "fehler": "Anruf ist noch nicht verbunden"}
+
+        remote = str(self.dialog.remote_uri or "")
+        host = remote.split("@")[-1] if "@" in remote else f"{self.invite.remote_addr[0]}:{self.invite.remote_addr[1]}"
+        refer_to = f"sip:{target}@{host}"
+        request_uri = self.invite.headers.get("Contact") or remote
+        if not str(request_uri).startswith("sip:"):
+            request_uri = f"sip:{request_uri}"
+
+        lines = [
+            f"REFER {request_uri} SIP/2.0",
+            f"Via: SIP/2.0/UDP {self.dialog.local_uri};branch=z9hG4bK{uuid.uuid4().hex[:16]};rport",
+            "Max-Forwards: 70",
+            f"Call-ID: {self.call_id}",
+            f"From: <sip:{self.dialog.local_uri}>;tag={self.dialog.local_tag}",
+            f"To: <sip:{remote}>;tag={self.dialog.remote_tag}",
+            f"CSeq: {self.dialog.cseq + 1} REFER",
+            f"Contact: <sip:{self.dialog.local_uri}>",
+            f"Refer-To: <{refer_to}>",
+            "Referred-By: <sip:ai@" + str(self.local_ip) + ">",
+            "Content-Length: 0",
+            "",
+            "",
+        ]
+        await self.sip.send_message("\r\n".join(lines).encode("utf-8"), self.invite.remote_addr)
+        logger.info("REFER sent", call_id=self.call_id, refer_to=refer_to)
+        return {"ok": True, "refer_to": refer_to}
 
     async def hangup(self) -> None:
         """Hangup call (send BYE)."""

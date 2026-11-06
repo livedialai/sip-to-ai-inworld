@@ -205,12 +205,22 @@ async def create_ai_client(call: Any = None) -> AiDuplexClient:
             tenant_id=int(tenant.get("id") or 0) if tenant else 0,
         )
         base = config.ai.worker_base_url.rstrip("/")
+        transfer_number = str((tenant or {}).get("transfer_number") or "")
+
+        async def _do_transfer() -> dict:
+            if not transfer_number:
+                return {"ok": False, "fehler": "keine Transfernummer beim Tenant hinterlegt"}
+            if call is None or not hasattr(call, "refer"):
+                return {"ok": False, "fehler": "kein aktiver Anruf"}
+            return await call.refer(transfer_number)
+
         runner = ToolRunner(
             state,
             search_url=config.ai.search_url or f"{base}/tool/search",
             order_url=config.ai.order_url or f"{base}/s2s/order",
             phrases=(tenant or {}).get("phrases") or {},
             max_steps=int((tenant or {}).get("max_tool_steps") or 6),
+            transfer_fn=_do_transfer,
         )
         logger.info("tools enabled", count=len(runner.tools), call_id=state.call_id)
 

@@ -264,12 +264,14 @@ class ToolRunner:
         order_url: str,
         phrases: Optional[dict[str, str]] = None,
         max_steps: int = 6,
+        transfer_fn: Optional[Any] = None,
     ) -> None:
         self.state = state
         self.search_url = search_url
         self.order_url = order_url
         self.phrases = phrases or {}
         self.max_steps = max_steps
+        self.transfer_fn = transfer_fn
         self.tools = build_tools()
 
     async def run(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -311,7 +313,11 @@ class ToolRunner:
             if name == "bestellung_abschliessen":
                 return await abschluss(st, self.order_url)
             if name == "weiterleiten":
-                return {"ok": False, "hinweis": "Weiterleitung ist im Adapter noch nicht aktiv."}
+                if self.transfer_fn is None:
+                    return {"ok": False, "hinweis": "Weiterleitung ist nicht konfiguriert."}
+                out = await self.transfer_fn()
+                logger.info("transfer requested", call_id=st.call_id, result=str(out)[:160])
+                return out
             return {"fehler": f"unbekanntes Tool {name}"}
         except Exception as exc:  # noqa: BLE001
             logger.warning("tool failed", tool=name, error=str(exc))
