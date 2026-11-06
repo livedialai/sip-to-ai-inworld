@@ -56,7 +56,16 @@ def extract_identity(invite: Any, default_cc: str = "49") -> dict[str, str]:
            Traeks nur den Registrierungs-Namen, z.B. sip183911).
     ANI  = Anrufer (From, ersatzweise P-Asserted-Identity).
     """
-    did_raw = _header_number(invite, "To")
+    # Die DID steht je nach PBX/Trunk in der Request-URI (sip:0049…@host)
+    # oder im To-Header.  Reihenfolge: R-URI, dann To.
+    did_raw = ""
+    req_uri = getattr(invite, "request_uri", "") or ""
+    if req_uri:
+        m = re.search(r"sip:([^@;>]+)", str(req_uri))
+        if m:
+            did_raw = m.group(1)
+    if not did_raw or did_raw.isalpha():
+        did_raw = _header_number(invite, "To")
     ani_raw = _header_number(invite, "From") or _header_number(
         invite, "P-Asserted-Identity"
     )

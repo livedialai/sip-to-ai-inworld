@@ -198,6 +198,11 @@ async def create_ai_client(call: Any = None) -> AiDuplexClient:
                 voice=voice,
                 prompt_len=len(instructions or ""),
             )
+        if greeting and "Du bist Nadine" not in greeting:
+            greeting = (
+                "Du bist Nadine, die Mitarbeiterin vom Markt. Begruesse den Anrufer "
+                f'jetzt mit genau diesen Worten, ohne Zusatz: "{greeting}"'
+            )
         state = CallState(
             call_id=str(getattr(call, "call_id", "") or ""),
             did=did,
