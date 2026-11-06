@@ -14,6 +14,7 @@ from typing import Any, Optional
 import structlog
 
 from app.sip_async.async_call import SIP_TIMER_H, AsyncCall
+from app.identity import extract_identity
 from app.sip_async.sip_protocol import SIPMessage, SIPMethod, SIPMessageType, SIPProtocol
 
 logger = structlog.get_logger(__name__)
@@ -415,6 +416,17 @@ class AsyncSIPServer:
                 local_rtp_port = None
                 await self._send_simple_response(invite, addr, 488, "Not Acceptable Here")
                 return
+
+            # DID/ANI einmal an der Kante festhalten (E164 normalisiert)
+            call.identity = extract_identity(invite)
+            logger.info(
+                "call_identity",
+                call_id=call_id,
+                did=call.identity["did"],
+                did_raw=call.identity["did_raw"],
+                ani=call.identity["ani"],
+                ani_raw=call.identity["ani_raw"],
+            )
 
             # Store call (thread-safe)
             async with self._calls_lock:
