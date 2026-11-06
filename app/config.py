@@ -150,6 +150,7 @@ class AIConfig:
     worker_base_url: str = "https://jambonz.gofonia.de"
     search_url: str = ""
     order_url: str = ""
+    transfer_dial_format: str = "49"   # 49 = sipload, e164 = easybell/vsip, 0049 = national
 
     # Deepgram Configuration
     deepgram_api_key: str = ""
@@ -269,6 +270,7 @@ class Config:
             worker_base_url=os.getenv("WORKER_BASE_URL", "https://jambonz.gofonia.de"),
             search_url=os.getenv("SEARCH_URL", ""),
             order_url=os.getenv("ORDER_URL", ""),
+            transfer_dial_format=os.getenv("TRANSFER_DIAL_FORMAT", "49"),
             deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
             deepgram_listen_model=os.getenv("DEEPGRAM_LISTEN_MODEL", "flux-general-en"),
             deepgram_speak_model=os.getenv("DEEPGRAM_SPEAK_MODEL", "flux-kit-en"),

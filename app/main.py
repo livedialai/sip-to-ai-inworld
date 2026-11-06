@@ -212,7 +212,18 @@ async def create_ai_client(call: Any = None) -> AiDuplexClient:
                 return {"ok": False, "fehler": "keine Transfernummer beim Tenant hinterlegt"}
             if call is None or not hasattr(call, "refer"):
                 return {"ok": False, "fehler": "kein aktiver Anruf"}
-            return await call.refer(transfer_number)
+            # Wählformat je Trunk: sipload will 49…, easybell/vsip E164 (+49…)
+            fmt = (config.ai.transfer_dial_format or "49").lower()
+            dial = transfer_number.strip()
+            if fmt == "e164":
+                dial = dial if dial.startswith("+") else "+" + dial.lstrip("0")
+            elif fmt == "0049":
+                dial = "00" + dial.lstrip("+").lstrip("0")
+            else:  # "49" (sipload)
+                dial = dial.lstrip("+")
+                dial = dial[2:] if dial.startswith("00") else dial
+            logger.info("transfer dial", tenant_number=transfer_number, dial=dial, format=fmt)
+            return await call.refer(dial)
 
         runner = ToolRunner(
             state,
